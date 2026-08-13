@@ -5,6 +5,7 @@ compile_error!("Capture Viewer is a native macOS application.");
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
+use std::sync::Mutex;
 
 type Id = *mut c_void;
 type Class = *mut c_void;
@@ -18,6 +19,8 @@ const AUTH_NOT_DETERMINED: isize = 0;
 const AUTH_RESTRICTED: isize = 1;
 const AUTH_DENIED: isize = 2;
 const AUTH_AUTHORIZED: isize = 3;
+const PIXEL_FORMAT_BGRA: u32 = u32::from_be_bytes(*b"BGRA");
+const PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -38,6 +41,15 @@ struct Size {
 struct Rect {
     origin: Point,
     size: Size,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Time {
+    value: i64,
+    timescale: i32,
+    flags: u32,
+    epoch: i64,
 }
 
 #[repr(C)]
@@ -93,6 +105,33 @@ extern "C" {}
 #[link(name = "QuartzCore", kind = "framework")]
 extern "C" {}
 
+#[link(name = "CoreMedia", kind = "framework")]
+extern "C" {
+    fn CMVideoFormatDescriptionGetPresentationDimensions(
+        video_description: Id,
+        use_pixel_aspect_ratio: u8,
+        use_clean_aperture: u8,
+    ) -> Size;
+    fn CMSampleBufferGetImageBuffer(sample_buffer: Id) -> Id;
+}
+
+#[link(name = "CoreVideo", kind = "framework")]
+extern "C" {
+    static kCVPixelBufferPixelFormatTypeKey: Id;
+    fn CVPixelBufferGetPixelFormatType(pixel_buffer: Id) -> u32;
+    fn CVPixelBufferGetWidth(pixel_buffer: Id) -> usize;
+    fn CVPixelBufferGetHeight(pixel_buffer: Id) -> usize;
+    fn CVPixelBufferGetBytesPerRow(pixel_buffer: Id) -> usize;
+    fn CVPixelBufferGetBaseAddress(pixel_buffer: Id) -> *mut c_void;
+    fn CVPixelBufferLockBaseAddress(pixel_buffer: Id, flags: u64) -> i32;
+    fn CVPixelBufferUnlockBaseAddress(pixel_buffer: Id, flags: u64) -> i32;
+}
+
+#[link(name = "System")]
+extern "C" {
+    fn dispatch_queue_create(label: *const c_char, attribute: *const c_void) -> Id;
+}
+
 #[link(name = "AVFoundation", kind = "framework")]
 extern "C" {
     static AVMediaTypeVideo: Id;
@@ -100,6 +139,7 @@ extern "C" {
     static AVLayerVideoGravityResizeAspect: Id;
     static AVCaptureDeviceWasConnectedNotification: Id;
     static AVCaptureDeviceWasDisconnectedNotification: Id;
+    static AVCaptureInputPortFormatDescriptionDidChangeNotification: Id;
 }
 
 unsafe fn selector(name: &'static [u8]) -> Sel {
@@ -223,6 +263,53 @@ unsafe fn release(value: Id) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct CropInsets {
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+}
+
+impl CropInsets {
+    fn approximately_equals(self, other: Self) -> bool {
+        (self.left - other.left).abs() < 0.004
+            && (self.right - other.right).abs() < 0.004
+            && (self.top - other.top).abs() < 0.004
+            && (self.bottom - other.bottom).abs() < 0.004
+    }
+
+    fn active_width(self) -> f64 {
+        1.0 - self.left - self.right
+    }
+
+    fn active_height(self) -> f64 {
+        1.0 - self.top - self.bottom
+    }
+}
+
+struct CropAnalysisState {
+    candidate: CropInsets,
+    candidate_hits: u8,
+    applied: CropInsets,
+}
+
+static CROP_ANALYSIS: Mutex<CropAnalysisState> = Mutex::new(CropAnalysisState {
+    candidate: CropInsets {
+        left: 0.0,
+        right: 0.0,
+        top: 0.0,
+        bottom: 0.0,
+    },
+    candidate_hits: 0,
+    applied: CropInsets {
+        left: 0.0,
+        right: 0.0,
+        top: 0.0,
+        bottom: 0.0,
+    },
+});
+
 struct AppState {
     controller: Id,
     window: Id,
@@ -232,11 +319,15 @@ struct AppState {
     audio_devices: Id,
     video_input: Id,
     audio_input: Id,
+    _video_analysis_output: Id,
     _audio_output: Id,
     source_menu: Id,
     audio_menu: Id,
     selected_video_uid: String,
     selected_audio_uid: Option<String>,
+    video_format_aspect_ratio: f64,
+    video_aspect_ratio: f64,
+    video_crop: CropInsets,
     session_started: bool,
 }
 
@@ -431,6 +522,32 @@ unsafe fn error_description(error: Id) -> String {
     }
 }
 
+fn reset_crop_analysis() {
+    if let Ok(mut analysis) = CROP_ANALYSIS.lock() {
+        *analysis = CropAnalysisState {
+            candidate: CropInsets::default(),
+            candidate_hits: 0,
+            applied: CropInsets::default(),
+        };
+    }
+}
+
+unsafe fn request_preview_layout() {
+    let content_view = msg!(state().window, "contentView" => Id);
+    if !content_view.is_null() {
+        msg!(content_view, "setNeedsLayout:", YES; ObjcBool => ());
+        msg!(content_view, "layoutSubtreeIfNeeded" => ());
+    }
+}
+
+unsafe fn reset_video_geometry() {
+    state().video_format_aspect_ratio = 0.0;
+    state().video_aspect_ratio = 0.0;
+    state().video_crop = CropInsets::default();
+    reset_crop_analysis();
+    request_preview_layout();
+}
+
 unsafe fn clear_inputs() {
     let app_state = state();
     msg!(app_state.session, "beginConfiguration" => ());
@@ -443,6 +560,267 @@ unsafe fn clear_inputs() {
         app_state.audio_input = NIL;
     }
     msg!(app_state.session, "commitConfiguration" => ());
+    reset_video_geometry();
+}
+
+fn content_size_for_aspect(current: Size, aspect_ratio: f64) -> Size {
+    let mut height = current.height.max(180.0);
+    let mut width = height * aspect_ratio;
+    if width < 320.0 {
+        width = 320.0;
+        height = width / aspect_ratio;
+    }
+    Size { width, height }
+}
+
+fn preview_frame_for_crop(bounds: Rect, source_aspect_ratio: f64, crop: CropInsets) -> Rect {
+    let active_width_fraction = crop.active_width();
+    let active_height_fraction = crop.active_height();
+    if source_aspect_ratio <= 0.0
+        || active_width_fraction <= 0.0
+        || active_height_fraction <= 0.0
+        || bounds.size.width <= 0.0
+        || bounds.size.height <= 0.0
+    {
+        return bounds;
+    }
+
+    let active_aspect_ratio = source_aspect_ratio * active_width_fraction / active_height_fraction;
+    let bounds_aspect_ratio = bounds.size.width / bounds.size.height;
+    let active_size = if bounds_aspect_ratio > active_aspect_ratio {
+        Size {
+            width: bounds.size.height * active_aspect_ratio,
+            height: bounds.size.height,
+        }
+    } else {
+        Size {
+            width: bounds.size.width,
+            height: bounds.size.width / active_aspect_ratio,
+        }
+    };
+    let active_origin = Point {
+        x: bounds.origin.x + (bounds.size.width - active_size.width) / 2.0,
+        y: bounds.origin.y + (bounds.size.height - active_size.height) / 2.0,
+    };
+    let full_size = Size {
+        width: active_size.width / active_width_fraction,
+        height: active_size.height / active_height_fraction,
+    };
+
+    Rect {
+        origin: Point {
+            x: active_origin.x - crop.left * full_size.width,
+            y: active_origin.y - crop.bottom * full_size.height,
+        },
+        size: full_size,
+    }
+}
+
+fn pixel_is_dark(pixel: &[u8]) -> bool {
+    pixel[0] <= 24 && pixel[1] <= 24 && pixel[2] <= 24
+}
+
+fn vertical_band_is_dark(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    bytes_per_row: usize,
+    start_x: usize,
+    band_width: usize,
+) -> bool {
+    let sample_step = (height / 96).max(1);
+    let mut samples = 0usize;
+    let mut dark_samples = 0usize;
+    for y in (0..height).step_by(sample_step) {
+        for x in start_x..(start_x + band_width).min(width) {
+            let offset = y * bytes_per_row + x * 4;
+            samples += 1;
+            if pixel_is_dark(&pixels[offset..offset + 4]) {
+                dark_samples += 1;
+            }
+        }
+    }
+    samples > 0 && dark_samples * 100 >= samples * 98
+}
+
+fn horizontal_band_is_dark(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    bytes_per_row: usize,
+    start_y: usize,
+    band_height: usize,
+) -> bool {
+    let sample_step = (width / 96).max(1);
+    let mut samples = 0usize;
+    let mut dark_samples = 0usize;
+    for y in start_y..(start_y + band_height).min(height) {
+        for x in (0..width).step_by(sample_step) {
+            let offset = y * bytes_per_row + x * 4;
+            samples += 1;
+            if pixel_is_dark(&pixels[offset..offset + 4]) {
+                dark_samples += 1;
+            }
+        }
+    }
+    samples > 0 && dark_samples * 100 >= samples * 98
+}
+
+fn detect_black_bars_bgra(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    bytes_per_row: usize,
+) -> CropInsets {
+    const BAND_SIZE: usize = 4;
+    if width < 64
+        || height < 64
+        || bytes_per_row < width * 4
+        || pixels.len() < bytes_per_row * height
+    {
+        return CropInsets::default();
+    }
+
+    let max_horizontal_crop = width / 3;
+    let mut left = 0usize;
+    while left + BAND_SIZE <= max_horizontal_crop
+        && vertical_band_is_dark(pixels, width, height, bytes_per_row, left, BAND_SIZE)
+    {
+        left += BAND_SIZE;
+    }
+    let mut right = 0usize;
+    while right + BAND_SIZE <= max_horizontal_crop
+        && vertical_band_is_dark(
+            pixels,
+            width,
+            height,
+            bytes_per_row,
+            width - right - BAND_SIZE,
+            BAND_SIZE,
+        )
+    {
+        right += BAND_SIZE;
+    }
+
+    let max_vertical_crop = height / 3;
+    let mut top = 0usize;
+    while top + BAND_SIZE <= max_vertical_crop
+        && horizontal_band_is_dark(pixels, width, height, bytes_per_row, top, BAND_SIZE)
+    {
+        top += BAND_SIZE;
+    }
+    let mut bottom = 0usize;
+    while bottom + BAND_SIZE <= max_vertical_crop
+        && horizontal_band_is_dark(
+            pixels,
+            width,
+            height,
+            bytes_per_row,
+            height - bottom - BAND_SIZE,
+            BAND_SIZE,
+        )
+    {
+        bottom += BAND_SIZE;
+    }
+
+    if left < width / 100 {
+        left = 0;
+    }
+    if right < width / 100 {
+        right = 0;
+    }
+    if top < height / 100 {
+        top = 0;
+    }
+    if bottom < height / 100 {
+        bottom = 0;
+    }
+    if left + right > width / 2 {
+        left = 0;
+        right = 0;
+    }
+    if top + bottom > height / 2 {
+        top = 0;
+        bottom = 0;
+    }
+
+    CropInsets {
+        left: left as f64 / width as f64,
+        right: right as f64 / width as f64,
+        top: top as f64 / height as f64,
+        bottom: bottom as f64 / height as f64,
+    }
+}
+
+unsafe fn resize_window_for_aspect(aspect_ratio: f64) {
+    let previous_aspect_ratio = state().video_aspect_ratio;
+    state().video_aspect_ratio = aspect_ratio;
+    if previous_aspect_ratio > 0.0
+        && ((aspect_ratio - previous_aspect_ratio) / previous_aspect_ratio).abs() < 0.002
+    {
+        return;
+    }
+
+    let content_view = msg!(state().window, "contentView" => Id);
+    if content_view.is_null() {
+        return;
+    }
+    let current_size = send_rect(content_view, b"bounds\0").size;
+    let new_size = content_size_for_aspect(current_size, aspect_ratio);
+    msg!(state().window, "setContentSize:", new_size; Size => ());
+}
+
+unsafe fn apply_video_crop(crop: CropInsets) {
+    state().video_crop = crop;
+    let format_aspect_ratio = state().video_format_aspect_ratio;
+    let active_width = crop.active_width();
+    let active_height = crop.active_height();
+    if format_aspect_ratio > 0.0 && active_width > 0.0 && active_height > 0.0 {
+        resize_window_for_aspect(format_aspect_ratio * active_width / active_height);
+    }
+    request_preview_layout();
+}
+
+unsafe fn update_window_for_video_port(port: Id, reset_detected_crop: bool) {
+    if port.is_null()
+        || state().video_input.is_null()
+        || msg!(port, "input" => Id) != state().video_input
+    {
+        return;
+    }
+
+    let media_type = msg!(port, "mediaType" => Id);
+    if media_type.is_null()
+        || msg!(media_type, "isEqualToString:", AVMediaTypeVideo; Id => ObjcBool) != YES
+    {
+        return;
+    }
+
+    let format_description = msg!(port, "formatDescription" => Id);
+    if format_description.is_null() {
+        return;
+    }
+    let dimensions = CMVideoFormatDescriptionGetPresentationDimensions(format_description, 1, 1);
+    if dimensions.width <= 0.0 || dimensions.height <= 0.0 {
+        return;
+    }
+
+    if reset_detected_crop {
+        reset_crop_analysis();
+        state().video_crop = CropInsets::default();
+    }
+    state().video_format_aspect_ratio = dimensions.width / dimensions.height;
+    apply_video_crop(state().video_crop);
+}
+
+unsafe fn update_window_for_video_input(input: Id) {
+    if input.is_null() {
+        return;
+    }
+    let ports = msg!(input, "ports" => Id);
+    for index in 0..array_count(ports) {
+        update_window_for_video_port(array_item(ports, index), false);
+    }
 }
 
 unsafe fn start_session_once() {
@@ -495,6 +873,7 @@ unsafe fn configure_capture(video_device: Id) {
         msg!(session, "removeInput:", state().audio_input; Id => ());
         state().audio_input = NIL;
     }
+    reset_video_geometry();
 
     let mut video_error = NIL;
     let video_input = msg!(
@@ -544,6 +923,7 @@ unsafe fn configure_capture(video_device: Id) {
     }
 
     msg!(session, "commitConfiguration" => ());
+    update_window_for_video_input(video_input);
     start_session_once();
 
     let title = if audio_auth == AUTH_NOT_DETERMINED {
@@ -745,6 +1125,113 @@ extern "C" fn capture_device_changed(_controller: Id, _command: Sel, _notificati
     }
 }
 
+extern "C" fn capture_format_changed(_controller: Id, _command: Sel, notification: Id) {
+    unsafe {
+        if STATE.is_null() || state().controller.is_null() {
+            return;
+        }
+        msg!(
+            state().controller,
+            "performSelectorOnMainThread:withObject:waitUntilDone:",
+            selector(b"applyVideoFormat:\0"); Sel,
+            notification; Id,
+            NO; ObjcBool => ()
+        );
+    }
+}
+
+extern "C" fn apply_video_format(_controller: Id, _command: Sel, notification: Id) {
+    unsafe {
+        if STATE.is_null() || notification.is_null() {
+            return;
+        }
+        update_window_for_video_port(msg!(notification, "object" => Id), true);
+    }
+}
+
+extern "C" fn capture_output(
+    _controller: Id,
+    _command: Sel,
+    output: Id,
+    sample_buffer: Id,
+    _connection: Id,
+) {
+    unsafe {
+        if STATE.is_null() || output != state()._video_analysis_output {
+            return;
+        }
+    }
+
+    let pixel_buffer = unsafe { CMSampleBufferGetImageBuffer(sample_buffer) };
+    if pixel_buffer.is_null()
+        || unsafe { CVPixelBufferGetPixelFormatType(pixel_buffer) } != PIXEL_FORMAT_BGRA
+        || unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, PIXEL_BUFFER_LOCK_READ_ONLY) } != 0
+    {
+        return;
+    }
+
+    let width = unsafe { CVPixelBufferGetWidth(pixel_buffer) };
+    let height = unsafe { CVPixelBufferGetHeight(pixel_buffer) };
+    let bytes_per_row = unsafe { CVPixelBufferGetBytesPerRow(pixel_buffer) };
+    let base_address = unsafe { CVPixelBufferGetBaseAddress(pixel_buffer) };
+    let detected_crop = if base_address.is_null() {
+        CropInsets::default()
+    } else {
+        let pixels = unsafe {
+            std::slice::from_raw_parts(base_address.cast::<u8>(), bytes_per_row * height)
+        };
+        detect_black_bars_bgra(pixels, width, height, bytes_per_row)
+    };
+    unsafe {
+        CVPixelBufferUnlockBaseAddress(pixel_buffer, PIXEL_BUFFER_LOCK_READ_ONLY);
+    }
+
+    let should_apply = if let Ok(mut analysis) = CROP_ANALYSIS.lock() {
+        if analysis.candidate.approximately_equals(detected_crop) {
+            analysis.candidate_hits = analysis.candidate_hits.saturating_add(1);
+        } else {
+            analysis.candidate = detected_crop;
+            analysis.candidate_hits = 1;
+        }
+        if analysis.candidate_hits >= 3
+            && !analysis.applied.approximately_equals(analysis.candidate)
+        {
+            analysis.applied = analysis.candidate;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if should_apply {
+        unsafe {
+            msg!(
+                state().controller,
+                "performSelectorOnMainThread:withObject:waitUntilDone:",
+                selector(b"applyDetectedCrop:\0"); Sel,
+                NIL; Id,
+                NO; ObjcBool => ()
+            );
+        }
+    }
+}
+
+extern "C" fn apply_detected_crop(_controller: Id, _command: Sel, _sender: Id) {
+    unsafe {
+        if STATE.is_null() {
+            return;
+        }
+        let crop = if let Ok(analysis) = CROP_ANALYSIS.lock() {
+            analysis.applied
+        } else {
+            return;
+        };
+        apply_video_crop(crop);
+    }
+}
+
 extern "C" fn terminate_after_last_window(_controller: Id, _command: Sel, _app: Id) -> ObjcBool {
     YES
 }
@@ -769,7 +1256,12 @@ extern "C" fn capture_view_layout(view: Id, _command: Sel) {
 
         if !STATE.is_null() && !state().preview_layer.is_null() {
             let bounds = send_rect(view, b"bounds\0");
-            msg!(state().preview_layer, "setFrame:", bounds; Rect => ());
+            let preview_frame = preview_frame_for_crop(
+                bounds,
+                state().video_format_aspect_ratio,
+                state().video_crop,
+            );
+            msg!(state().preview_layer, "setFrame:", preview_frame; Rect => ());
         }
     }
 }
@@ -806,6 +1298,30 @@ unsafe fn register_classes() -> (Class, Class) {
         controller_class,
         selector(b"captureDeviceChanged:\0"),
         capture_device_changed as *const c_void,
+        c"v@:@".as_ptr(),
+    );
+    class_addMethod(
+        controller_class,
+        selector(b"captureFormatChanged:\0"),
+        capture_format_changed as *const c_void,
+        c"v@:@".as_ptr(),
+    );
+    class_addMethod(
+        controller_class,
+        selector(b"applyVideoFormat:\0"),
+        apply_video_format as *const c_void,
+        c"v@:@".as_ptr(),
+    );
+    class_addMethod(
+        controller_class,
+        selector(b"captureOutput:didOutputSampleBuffer:fromConnection:\0"),
+        capture_output as *const c_void,
+        c"v@:@@@".as_ptr(),
+    );
+    class_addMethod(
+        controller_class,
+        selector(b"applyDetectedCrop:\0"),
+        apply_detected_crop as *const c_void,
         c"v@:@".as_ptr(),
     );
     class_addMethod(
@@ -908,6 +1424,7 @@ unsafe fn build_window(view_class: Class, session: Id) -> (Id, Id) {
     let black = msg!(class(b"NSColor\0"), "blackColor" => Id);
     let black_cg_color = msg!(black, "CGColor" => Id);
     msg!(backing_layer, "setBackgroundColor:", black_cg_color; Id => ());
+    msg!(backing_layer, "setMasksToBounds:", YES; ObjcBool => ());
 
     let preview_layer = msg!(
         class(b"AVCaptureVideoPreviewLayer\0"),
@@ -925,6 +1442,48 @@ unsafe fn build_window(view_class: Class, session: Id) -> (Id, Id) {
     msg!(window, "setContentView:", view; Id => ());
     release(view);
     (window, preview_layer)
+}
+
+unsafe fn build_video_analysis_output(session: Id, controller: Id) -> Id {
+    let output = msg!(class(b"AVCaptureVideoDataOutput\0"), "new" => Id);
+    let pixel_format = msg!(
+        class(b"NSNumber\0"),
+        "numberWithUnsignedInt:",
+        PIXEL_FORMAT_BGRA; u32 => Id
+    );
+    let video_settings = msg!(
+        class(b"NSDictionary\0"),
+        "dictionaryWithObject:forKey:",
+        pixel_format; Id,
+        kCVPixelBufferPixelFormatTypeKey; Id => Id
+    );
+    msg!(output, "setVideoSettings:", video_settings; Id => ());
+    msg!(output, "setAlwaysDiscardsLateVideoFrames:", YES; ObjcBool => ());
+    msg!(
+        output,
+        "setMinFrameDuration:",
+        Time {
+            value: 1,
+            timescale: 4,
+            flags: 1,
+            epoch: 0,
+        }; Time => ()
+    );
+
+    let callback_queue = dispatch_queue_create(
+        c"com.capture-viewer.black-bar-detection".as_ptr(),
+        ptr::null(),
+    );
+    msg!(
+        output,
+        "setSampleBufferDelegate:queue:",
+        controller; Id,
+        callback_queue; Id => ()
+    );
+    if msg!(session, "canAddOutput:", output; Id => ObjcBool) == YES {
+        msg!(session, "addOutput:", output; Id => ());
+    }
+    output
 }
 
 unsafe fn install_device_notifications(controller: Id) {
@@ -945,6 +1504,14 @@ unsafe fn install_device_notifications(controller: Id) {
         AVCaptureDeviceWasDisconnectedNotification; Id,
         NIL; Id => ()
     );
+    msg!(
+        center,
+        "addObserver:selector:name:object:",
+        controller; Id,
+        selector(b"captureFormatChanged:\0"); Sel,
+        AVCaptureInputPortFormatDescriptionDidChangeNotification; Id,
+        NIL; Id => ()
+    );
 }
 
 fn main() {
@@ -963,6 +1530,7 @@ fn main() {
         if msg!(session, "canAddOutput:", audio_output; Id => ObjcBool) == YES {
             msg!(session, "addOutput:", audio_output; Id => ());
         }
+        let video_analysis_output = build_video_analysis_output(session, controller);
 
         let (window, preview_layer) = build_window(view_class, session);
         let (source_menu, audio_menu) = build_menu(app, controller);
@@ -976,11 +1544,15 @@ fn main() {
             audio_devices: NIL,
             video_input: NIL,
             audio_input: NIL,
+            _video_analysis_output: video_analysis_output,
             _audio_output: audio_output,
             source_menu,
             audio_menu,
             selected_video_uid: String::new(),
             selected_audio_uid: None,
+            video_format_aspect_ratio: 0.0,
+            video_aspect_ratio: 0.0,
+            video_crop: CropInsets::default(),
             session_started: false,
         }));
 
@@ -999,7 +1571,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::normalized_device_name;
+    use super::{
+        content_size_for_aspect, detect_black_bars_bgra, normalized_device_name,
+        preview_frame_for_crop, CropInsets, Point, Rect, Size,
+    };
 
     #[test]
     fn pairs_generic_usb_video_and_audio_names() {
@@ -1015,5 +1590,94 @@ mod tests {
             normalized_device_name("UGREEN 15389 Video"),
             normalized_device_name("UGREEN 15389 Audio Input")
         );
+    }
+
+    #[test]
+    fn snaps_window_to_new_video_aspect_without_changing_its_height() {
+        let resized = content_size_for_aspect(
+            Size {
+                width: 960.0,
+                height: 540.0,
+            },
+            4.0 / 3.0,
+        );
+
+        assert_eq!(resized.width, 720.0);
+        assert_eq!(resized.height, 540.0);
+    }
+
+    #[test]
+    fn keeps_narrow_video_large_enough_to_use() {
+        let resized = content_size_for_aspect(
+            Size {
+                width: 960.0,
+                height: 180.0,
+            },
+            9.0 / 16.0,
+        );
+
+        assert_eq!(resized.width, 320.0);
+        assert_eq!(resized.height, 320.0 / (9.0 / 16.0));
+    }
+
+    #[test]
+    fn detects_four_by_three_picture_padded_inside_sixteen_by_nine() {
+        let width = 1920usize;
+        let height = 1080usize;
+        let bytes_per_row = width * 4;
+        let mut pixels = vec![0u8; bytes_per_row * height];
+        for y in 0..height {
+            for x in 240..1680 {
+                let offset = y * bytes_per_row + x * 4;
+                pixels[offset..offset + 4].copy_from_slice(&[180, 180, 180, 255]);
+            }
+        }
+
+        let crop = detect_black_bars_bgra(&pixels, width, height, bytes_per_row);
+
+        assert!((crop.left - 0.125).abs() < 0.001);
+        assert!((crop.right - 0.125).abs() < 0.001);
+        assert_eq!(crop.top, 0.0);
+        assert_eq!(crop.bottom, 0.0);
+    }
+
+    #[test]
+    fn does_not_treat_a_temporarily_black_frame_as_extreme_padding() {
+        let width = 320usize;
+        let height = 180usize;
+        let bytes_per_row = width * 4;
+        let pixels = vec![0u8; bytes_per_row * height];
+
+        let crop = detect_black_bars_bgra(&pixels, width, height, bytes_per_row);
+
+        assert_eq!(crop.left, 0.0);
+        assert_eq!(crop.right, 0.0);
+        assert_eq!(crop.top, 0.0);
+        assert_eq!(crop.bottom, 0.0);
+    }
+
+    #[test]
+    fn expands_preview_layer_to_clip_detected_bars() {
+        let frame = preview_frame_for_crop(
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 720.0,
+                    height: 540.0,
+                },
+            },
+            16.0 / 9.0,
+            CropInsets {
+                left: 0.125,
+                right: 0.125,
+                top: 0.0,
+                bottom: 0.0,
+            },
+        );
+
+        assert!((frame.origin.x + 120.0).abs() < 0.001);
+        assert_eq!(frame.origin.y, 0.0);
+        assert!((frame.size.width - 960.0).abs() < 0.001);
+        assert_eq!(frame.size.height, 540.0);
     }
 }

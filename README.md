@@ -15,7 +15,8 @@ I bought a few small N150 mini PCs and wanted to set them up to run headless. A
 cheap USB-C HDMI capture card and a wireless keyboard with a built-in trackpad are
 all I need to turn my Mac into a temporary setup console: connect the mini PC,
 finish the initial setup, enable remote access, then unplug everything and let it
-run headless.
+run headless. Especially because im traveling and do not have access to other monitors 
+etc, and I am not hauling extra monitors around while traveling haha!
 
 I did not want to launch QuickTime or install an entire OBS production studio just
 to see an HDMI input. I wanted one tiny app that opens fast, lets me choose a

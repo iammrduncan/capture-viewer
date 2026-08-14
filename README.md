@@ -69,12 +69,13 @@ audio and video devices as linked; **File > Audio Source** provides a manual cho
 for inexpensive cards that expose unrelated USB device names. **File > Refresh
 Sources** rescans after plugging in hardware (hot-plug events also rescan).
 
-The window can be resized freely. When the capture source changes resolution, the
-window snaps to the new aspect ratio automatically. Some HDMI sources keep sending a
-fixed 16:9 signal and pad other resolutions with black bars; Capture Viewer samples
-occasional frames to detect and crop that padding without copying or retaining the
-frames. Manual window sizes preserve the active picture's aspect ratio and are
-letterboxed when necessary. Audio goes directly to the current default macOS output.
+The window can be resized freely, and the active picture automatically fits the
+existing window when either one changes size. Enable **File > Resize Window with
+Source** when you also want source aspect-ratio changes to resize the window itself.
+Some HDMI sources keep sending a fixed 16:9 signal and pad other resolutions with
+black bars; Capture Viewer samples occasional frames to detect and crop that padding
+without copying or retaining the frames. Audio goes directly to the current default
+macOS output.
 
 For development, `cargo run` also works; the usage descriptions are embedded in the
 Mach-O binary by `build.rs`.

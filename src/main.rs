@@ -328,6 +328,7 @@ struct AppState {
     video_format_aspect_ratio: f64,
     video_aspect_ratio: f64,
     video_crop: CropInsets,
+    auto_resize_window: bool,
     session_started: bool,
 }
 
@@ -752,15 +753,7 @@ fn detect_black_bars_bgra(
     }
 }
 
-unsafe fn resize_window_for_aspect(aspect_ratio: f64) {
-    let previous_aspect_ratio = state().video_aspect_ratio;
-    state().video_aspect_ratio = aspect_ratio;
-    if previous_aspect_ratio > 0.0
-        && ((aspect_ratio - previous_aspect_ratio) / previous_aspect_ratio).abs() < 0.002
-    {
-        return;
-    }
-
+unsafe fn resize_window_to_aspect(aspect_ratio: f64) {
     let content_view = msg!(state().window, "contentView" => Id);
     if content_view.is_null() {
         return;
@@ -770,13 +763,25 @@ unsafe fn resize_window_for_aspect(aspect_ratio: f64) {
     msg!(state().window, "setContentSize:", new_size; Size => ());
 }
 
+unsafe fn update_video_aspect_ratio(aspect_ratio: f64) {
+    let previous_aspect_ratio = state().video_aspect_ratio;
+    state().video_aspect_ratio = aspect_ratio;
+    if !state().auto_resize_window
+        || (previous_aspect_ratio > 0.0
+            && ((aspect_ratio - previous_aspect_ratio) / previous_aspect_ratio).abs() < 0.002)
+    {
+        return;
+    }
+    resize_window_to_aspect(aspect_ratio);
+}
+
 unsafe fn apply_video_crop(crop: CropInsets) {
     state().video_crop = crop;
     let format_aspect_ratio = state().video_format_aspect_ratio;
     let active_width = crop.active_width();
     let active_height = crop.active_height();
     if format_aspect_ratio > 0.0 && active_width > 0.0 && active_height > 0.0 {
-        resize_window_for_aspect(format_aspect_ratio * active_width / active_height);
+        update_video_aspect_ratio(format_aspect_ratio * active_width / active_height);
     }
     request_preview_layout();
 }
@@ -1106,6 +1111,18 @@ extern "C" fn refresh_sources(_controller: Id, _command: Sel, _sender: Id) {
     unsafe { reload_devices() }
 }
 
+extern "C" fn toggle_auto_resize_window(_controller: Id, _command: Sel, sender: Id) {
+    unsafe {
+        state().auto_resize_window = !state().auto_resize_window;
+        let checked: isize = if state().auto_resize_window { 1 } else { 0 };
+        msg!(sender, "setState:", checked; isize => ());
+
+        if state().auto_resize_window && state().video_aspect_ratio > 0.0 {
+            resize_window_to_aspect(state().video_aspect_ratio);
+        }
+    }
+}
+
 extern "C" fn permissions_changed(_controller: Id, _command: Sel, _sender: Id) {
     unsafe { reload_devices() }
 }
@@ -1290,6 +1307,12 @@ unsafe fn register_classes() -> (Class, Class) {
     );
     class_addMethod(
         controller_class,
+        selector(b"toggleAutoResizeWindow:\0"),
+        toggle_auto_resize_window as *const c_void,
+        c"v@:@".as_ptr(),
+    );
+    class_addMethod(
+        controller_class,
         selector(b"permissionsChanged:\0"),
         permissions_changed as *const c_void,
         c"v@:@".as_ptr(),
@@ -1378,6 +1401,14 @@ unsafe fn build_menu(app: Id, controller: Id) -> (Id, Id) {
     msg!(audio_menu, "setTitle:", ns_string("Audio Source"); Id => ());
     msg!(audio_item, "setSubmenu:", audio_menu; Id => ());
     add_menu_item(file_menu, audio_item);
+
+    let auto_resize = new_menu_item(
+        "Resize Window with Source",
+        selector(b"toggleAutoResizeWindow:\0"),
+        "",
+    );
+    msg!(auto_resize, "setTarget:", controller; Id => ());
+    add_menu_item(file_menu, auto_resize);
 
     let separator = msg!(class(b"NSMenuItem\0"), "separatorItem" => Id);
     msg!(file_menu, "addItem:", separator; Id => ());
@@ -1553,6 +1584,7 @@ fn main() {
             video_format_aspect_ratio: 0.0,
             video_aspect_ratio: 0.0,
             video_crop: CropInsets::default(),
+            auto_resize_window: false,
             session_started: false,
         }));
 

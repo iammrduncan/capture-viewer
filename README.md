@@ -74,9 +74,11 @@ The window can be resized freely, and the active picture automatically fits the
 existing window when either one changes size. Enable **File > Resize Window with
 Source** when you also want source aspect-ratio changes to resize the window itself.
 Some HDMI sources keep sending a fixed 16:9 signal and pad other resolutions with
-black bars; Capture Viewer samples occasional frames to detect and crop that padding
-without copying or retaining the frames. Audio goes directly to the current default
-macOS output.
+black bars. **File > Automatically Crop Black Bars** optionally samples occasional
+frames to detect and crop that padding without copying or retaining the frames.
+Cropping is off by default so dark desktops and changing screen content cannot move
+or zoom the picture. Turn it off to restore the full input image at any time. Audio
+goes directly to the current default macOS output.
 
 For development, `cargo run` also works; the usage descriptions are embedded in the
 Mach-O binary by `build.rs`.

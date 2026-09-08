@@ -288,13 +288,55 @@ impl CropInsets {
     }
 }
 
+#[derive(Default)]
 struct CropAnalysisState {
+    enabled: bool,
+    generation: u64,
     candidate: CropInsets,
     candidate_hits: u8,
     applied: CropInsets,
 }
 
+impl CropAnalysisState {
+    fn reset(&mut self) {
+        *self = Self {
+            enabled: self.enabled,
+            generation: self.generation.wrapping_add(1),
+            ..Self::default()
+        };
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.reset();
+    }
+
+    fn record(&mut self, detected_crop: CropInsets, generation: u64) -> bool {
+        if !self.enabled || generation != self.generation {
+            return false;
+        }
+        if self.candidate.approximately_equals(detected_crop) {
+            self.candidate_hits = self.candidate_hits.saturating_add(1);
+        } else {
+            self.candidate = detected_crop;
+            self.candidate_hits = 1;
+        }
+        if self.candidate_hits >= 3 && !self.applied.approximately_equals(self.candidate) {
+            self.applied = self.candidate;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn applied_crop(&self) -> Option<CropInsets> {
+        self.enabled.then_some(self.applied)
+    }
+}
+
 static CROP_ANALYSIS: Mutex<CropAnalysisState> = Mutex::new(CropAnalysisState {
+    enabled: false,
+    generation: 0,
     candidate: CropInsets {
         left: 0.0,
         right: 0.0,
@@ -319,7 +361,7 @@ struct AppState {
     audio_devices: Id,
     video_input: Id,
     audio_input: Id,
-    _video_analysis_output: Id,
+    video_analysis_output: Id,
     _audio_output: Id,
     source_menu: Id,
     audio_menu: Id,
@@ -328,6 +370,7 @@ struct AppState {
     video_format_aspect_ratio: f64,
     video_aspect_ratio: f64,
     video_crop: CropInsets,
+    auto_crop_black_bars: bool,
     auto_resize_window: bool,
     session_started: bool,
 }
@@ -525,11 +568,7 @@ unsafe fn error_description(error: Id) -> String {
 
 fn reset_crop_analysis() {
     if let Ok(mut analysis) = CROP_ANALYSIS.lock() {
-        *analysis = CropAnalysisState {
-            candidate: CropInsets::default(),
-            candidate_hits: 0,
-            applied: CropInsets::default(),
-        };
+        analysis.reset();
     }
 }
 
@@ -1123,6 +1162,35 @@ extern "C" fn toggle_auto_resize_window(_controller: Id, _command: Sel, sender: 
     }
 }
 
+extern "C" fn toggle_auto_crop_black_bars(_controller: Id, _command: Sel, sender: Id) {
+    unsafe {
+        let session = state().session;
+        msg!(session, "beginConfiguration" => ());
+        if state().auto_crop_black_bars {
+            msg!(session, "removeOutput:", state().video_analysis_output; Id => ());
+            state().auto_crop_black_bars = false;
+        } else {
+            if state().video_analysis_output.is_null() {
+                state().video_analysis_output = build_video_analysis_output(state().controller);
+            }
+            let output = state().video_analysis_output;
+            if msg!(session, "canAddOutput:", output; Id => ObjcBool) == YES {
+                msg!(session, "addOutput:", output; Id => ());
+                state().auto_crop_black_bars = true;
+            }
+        }
+        msg!(session, "commitConfiguration" => ());
+
+        let enabled = state().auto_crop_black_bars;
+        if let Ok(mut analysis) = CROP_ANALYSIS.lock() {
+            analysis.set_enabled(enabled);
+        }
+        let checked: isize = if enabled { 1 } else { 0 };
+        msg!(sender, "setState:", checked; isize => ());
+        apply_video_crop(CropInsets::default());
+    }
+}
+
 extern "C" fn permissions_changed(_controller: Id, _command: Sel, _sender: Id) {
     unsafe { reload_devices() }
 }
@@ -1167,17 +1235,18 @@ extern "C" fn apply_video_format(_controller: Id, _command: Sel, notification: I
 }
 
 extern "C" fn capture_output(
-    _controller: Id,
+    controller: Id,
     _command: Sel,
-    output: Id,
+    _output: Id,
     sample_buffer: Id,
     _connection: Id,
 ) {
-    unsafe {
-        if STATE.is_null() || output != state()._video_analysis_output {
-            return;
-        }
-    }
+    // Keep background callbacks independent of the main-thread AppState. Frames
+    // already in flight must not restore a crop after disabling it or switching sources.
+    let generation = match CROP_ANALYSIS.lock() {
+        Ok(analysis) if analysis.enabled => analysis.generation,
+        _ => return,
+    };
 
     let pixel_buffer = unsafe { CMSampleBufferGetImageBuffer(sample_buffer) };
     if pixel_buffer.is_null()
@@ -1204,20 +1273,7 @@ extern "C" fn capture_output(
     }
 
     let should_apply = if let Ok(mut analysis) = CROP_ANALYSIS.lock() {
-        if analysis.candidate.approximately_equals(detected_crop) {
-            analysis.candidate_hits = analysis.candidate_hits.saturating_add(1);
-        } else {
-            analysis.candidate = detected_crop;
-            analysis.candidate_hits = 1;
-        }
-        if analysis.candidate_hits >= 3
-            && !analysis.applied.approximately_equals(analysis.candidate)
-        {
-            analysis.applied = analysis.candidate;
-            true
-        } else {
-            false
-        }
+        analysis.record(detected_crop, generation)
     } else {
         false
     };
@@ -1225,7 +1281,7 @@ extern "C" fn capture_output(
     if should_apply {
         unsafe {
             msg!(
-                state().controller,
+                controller,
                 "performSelectorOnMainThread:withObject:waitUntilDone:",
                 selector(b"applyDetectedCrop:\0"); Sel,
                 NIL; Id,
@@ -1241,7 +1297,10 @@ extern "C" fn apply_detected_crop(_controller: Id, _command: Sel, _sender: Id) {
             return;
         }
         let crop = if let Ok(analysis) = CROP_ANALYSIS.lock() {
-            analysis.applied
+            match analysis.applied_crop() {
+                Some(crop) => crop,
+                None => return,
+            }
         } else {
             return;
         };
@@ -1278,7 +1337,11 @@ extern "C" fn capture_view_layout(view: Id, _command: Sel) {
                 state().video_format_aspect_ratio,
                 state().video_crop,
             );
+            let transaction = class(b"CATransaction\0");
+            msg!(transaction, "begin" => ());
+            msg!(transaction, "setDisableActions:", YES; ObjcBool => ());
             msg!(state().preview_layer, "setFrame:", preview_frame; Rect => ());
+            msg!(transaction, "commit" => ());
         }
     }
 }
@@ -1309,6 +1372,12 @@ unsafe fn register_classes() -> (Class, Class) {
         controller_class,
         selector(b"toggleAutoResizeWindow:\0"),
         toggle_auto_resize_window as *const c_void,
+        c"v@:@".as_ptr(),
+    );
+    class_addMethod(
+        controller_class,
+        selector(b"toggleAutoCropBlackBars:\0"),
+        toggle_auto_crop_black_bars as *const c_void,
         c"v@:@".as_ptr(),
     );
     class_addMethod(
@@ -1410,6 +1479,14 @@ unsafe fn build_menu(app: Id, controller: Id) -> (Id, Id) {
     msg!(auto_resize, "setTarget:", controller; Id => ());
     add_menu_item(file_menu, auto_resize);
 
+    let auto_crop = new_menu_item(
+        "Automatically Crop Black Bars",
+        selector(b"toggleAutoCropBlackBars:\0"),
+        "",
+    );
+    msg!(auto_crop, "setTarget:", controller; Id => ());
+    add_menu_item(file_menu, auto_crop);
+
     let separator = msg!(class(b"NSMenuItem\0"), "separatorItem" => Id);
     msg!(file_menu, "addItem:", separator; Id => ());
     let refresh = new_menu_item("Refresh Sources", selector(b"refreshSources:\0"), "r");
@@ -1475,7 +1552,7 @@ unsafe fn build_window(view_class: Class, session: Id) -> (Id, Id) {
     (window, preview_layer)
 }
 
-unsafe fn build_video_analysis_output(session: Id, controller: Id) -> Id {
+unsafe fn build_video_analysis_output(controller: Id) -> Id {
     let output = msg!(class(b"AVCaptureVideoDataOutput\0"), "new" => Id);
     let pixel_format = msg!(
         class(b"NSNumber\0"),
@@ -1511,9 +1588,6 @@ unsafe fn build_video_analysis_output(session: Id, controller: Id) -> Id {
         controller; Id,
         callback_queue; Id => ()
     );
-    if msg!(session, "canAddOutput:", output; Id => ObjcBool) == YES {
-        msg!(session, "addOutput:", output; Id => ());
-    }
     output
 }
 
@@ -1561,8 +1635,6 @@ fn main() {
         if msg!(session, "canAddOutput:", audio_output; Id => ObjcBool) == YES {
             msg!(session, "addOutput:", audio_output; Id => ());
         }
-        let video_analysis_output = build_video_analysis_output(session, controller);
-
         let (window, preview_layer) = build_window(view_class, session);
         let (source_menu, audio_menu) = build_menu(app, controller);
 
@@ -1575,7 +1647,7 @@ fn main() {
             audio_devices: NIL,
             video_input: NIL,
             audio_input: NIL,
-            _video_analysis_output: video_analysis_output,
+            video_analysis_output: NIL,
             _audio_output: audio_output,
             source_menu,
             audio_menu,
@@ -1584,6 +1656,7 @@ fn main() {
             video_format_aspect_ratio: 0.0,
             video_aspect_ratio: 0.0,
             video_crop: CropInsets::default(),
+            auto_crop_black_bars: false,
             auto_resize_window: false,
             session_started: false,
         }));
@@ -1605,8 +1678,81 @@ fn main() {
 mod tests {
     use super::{
         content_size_for_aspect, detect_black_bars_bgra, normalized_device_name,
-        preview_frame_for_crop, CropInsets, Point, Rect, Size,
+        preview_frame_for_crop, CropAnalysisState, CropInsets, Point, Rect, Size,
     };
+
+    #[test]
+    fn changing_dark_content_cannot_crop_the_preview_by_default() {
+        let mut analysis = CropAnalysisState::default();
+        for top in [0.1, 0.2, 0.0, 0.15] {
+            for _ in 0..10 {
+                assert!(!analysis.record(
+                    CropInsets {
+                        top,
+                        ..CropInsets::default()
+                    },
+                    analysis.generation,
+                ));
+            }
+        }
+        assert!(analysis.applied_crop().is_none());
+    }
+
+    #[test]
+    fn cropping_requires_opt_in_and_disabling_discards_pending_results() {
+        let mut analysis = CropAnalysisState::default();
+        let crop = CropInsets {
+            left: 0.125,
+            right: 0.125,
+            ..CropInsets::default()
+        };
+        analysis.set_enabled(true);
+        let generation = analysis.generation;
+        assert!(!analysis.record(crop, generation));
+        assert!(!analysis.record(crop, generation));
+        assert!(analysis.record(crop, generation));
+        assert!(analysis.applied_crop().unwrap().approximately_equals(crop));
+
+        analysis.set_enabled(false);
+        assert!(analysis.applied_crop().is_none());
+        for _ in 0..10 {
+            assert!(!analysis.record(crop, generation));
+        }
+
+        analysis.set_enabled(true);
+        for _ in 0..10 {
+            assert!(!analysis.record(crop, generation));
+        }
+        assert!(analysis
+            .applied_crop()
+            .unwrap()
+            .approximately_equals(CropInsets::default()));
+    }
+
+    #[test]
+    fn source_change_discards_in_flight_crop_analysis() {
+        let mut analysis = CropAnalysisState::default();
+        analysis.set_enabled(true);
+        let generation = analysis.generation;
+        let crop = CropInsets {
+            top: 0.1,
+            ..CropInsets::default()
+        };
+        assert!(!analysis.record(crop, generation));
+        assert!(!analysis.record(crop, generation));
+        analysis.reset();
+        for _ in 0..10 {
+            assert!(!analysis.record(crop, generation));
+        }
+        assert!(analysis
+            .applied_crop()
+            .unwrap()
+            .approximately_equals(CropInsets::default()));
+        let generation = analysis.generation;
+        assert!(!analysis.record(crop, generation));
+        assert!(!analysis.record(crop, generation));
+        assert!(analysis.record(crop, generation));
+    }
 
     #[test]
     fn pairs_generic_usb_video_and_audio_names() {
